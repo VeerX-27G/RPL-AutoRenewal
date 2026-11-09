@@ -23,7 +23,7 @@ load_dotenv()
 # visibly exactly as before.
 IS_CI = os.getenv("CI", "").lower() == "true"
 
-# Try https://www.reginalibrary.ca/myaccount/currently-borrowed for testing the software below.
+# Try https://www.reginalibrary.ca/myaccount/currently-borrowed for testing the software below but add '/overdue-soon' in production.
 RPL_url = "https://www.reginalibrary.ca/myaccount/currently-borrowed/overdue-soon"
 
 barcode = str(os.getenv("BARCODE"))
@@ -50,11 +50,10 @@ elements_to_be_scraped = {
     "Username Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[1]/input",
     "Password Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[2]/input",
     "Login Button": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/input[1]",
-# Same XPath for all books' names, renewal buttons, due dates and its number of renewals left.
-    "Book Name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div[1]/a",
-    "'Renew' Button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div[2]/form/input[1]",
-    "Due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/span",
-    "Renewals left": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span",
+    "Book's name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div[1]/a",
+    "Book's due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/span",
+    "'Renew' button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div[2]/form/input[1]",
+
 }
 
 today = dt.today().strftime("%d/%m/%Y")
@@ -108,60 +107,92 @@ try:
     wait = WebDriverWait(driver, 20 if IS_CI else 10)  # runners are a bit slower than a laptop
 
     # Try to log in
-    target_1 = wait.until(
+    login_page = wait.until(
         EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["Go to Login"]))
     )
-    target_1.click()
+    login_page.click()
 
-    # Type your uname and password
-    target_2 = wait.until(
+    # Type your username and password
+    uname_input = wait.until(
         EC.visibility_of_element_located((By.XPATH, elements_to_be_scraped["Username Input"]))
     )
-    target_2.send_keys(barcode)
-    target_3 = driver.find_element(By.XPATH, elements_to_be_scraped["Password Input"])
-    target_3.send_keys(password)
+    uname_input.send_keys(barcode)
+    pwd_input = driver.find_element(By.XPATH, elements_to_be_scraped["Password Input"])
+    pwd_input.send_keys(password)
     # Click login
-    target_4 = driver.find_element(By.XPATH, elements_to_be_scraped["Login Button"])
-    target_4.click()
+    login_button = driver.find_element(By.XPATH, elements_to_be_scraped["Login Button"])
+    login_button.click()
 
     # Send that message
     with smtplib.SMTP(SMTP_server, 587) as server:
-        server.ehlo()  # Identify yourself to the server
-        server.starttls()  # Secure the connection
-        server.ehlo()  # Re-identify as an encrypted connection
+        server.ehlo()       # Identify yourself to the server
+        server.starttls()   # Secure the connection
+        server.ehlo()       # Re-identify as an encrypted connection
 
         server.login(sender_email, sender_password)
-        # Click 'Renew' button for each book
+        # Click 'Renew' button for each book if due date is today:
+        # VERY IMPORTANT: First, check number of books:
+        # TODO: Try to inspect "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[1]/div[6]/button" = 'Renew All' button if available when you have at most one book borrowed.
+        i: int = 1  # Block of the first book's XPath.
         while True:
             try:
-                book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book Name"]).text
+                driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]")
+            except Exception as e:
+                print(f"Error: {e}\n")
+                if i > 1:       # If you have more than one book borrowed, this line is VERY important because it prevents the program from trying to renew a non-existent book.
+                    i -= 1
+                    if i < 2:
+                        print(f"There is {i} book in your account. So the software will try to renew it.")
+                    else:
+                        print(f"There are {i} books in your account. So the software will try to renew them all.")
+                    break       # To avoid the below 'if' statement work if 'i' was 2.
+
+                if i == 1:      # NOTE: 'i' will be still be 1 even if there are no books in the account.
+                    print(f"There are no books that will be overdue soon. So exit the program.")
+                    msg.set_content("No more books to be renewed today")
+                    server.send_message(msg)
+                    print("❌ No more books to renew.")
+                    driver.quit()
+                    sys.exit()
+
+            i += 1
+
+        # Renew 'i' number of books:
+        for j in range(1, i+1):
+            try:
+                book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
                 # If today's date matches book's renewal date, renew it and send an email
-                renewal_date = modify_date(driver.find_element(By.XPATH, elements_to_be_scraped["Due date"]).text.split())
-                print(f"Renewal date: {renewal_date} of book '{book_name}'")
-                if renewal_date == today:
+                due_date = modify_date(driver.find_element(By.XPATH, elements_to_be_scraped["Book's due date"]).text.split())
+                print(f"Due date: {due_date} of book '{book_name}'")
+                # Try due_date != today if you are testing this software but not in production.
+                if due_date == today:
                     try:
-                        target_5 = wait.until(
-                            EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["'Renew' Button"]))
+                        renewal_button = wait.until(
+                            EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["'Renew' button"]))
                         )
-                        target_5.click()
+                        renewal_button.click()
                         msg.set_content(f"Book '{book_name}' renewed successfully.")
                         server.send_message(msg)
                         # Book titles are deliberately not printed: workflow logs can be public.
                         print("🚀 Email sent successfully! -1")
+
+                        driver.refresh()    # VERY IMPORTANT: This is necessary to ensure that the book's status is updated after renewal.
                     except Exception as e:
-                        print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                        msg.set_content(f"Book '{book_name}' cannot be renewed because you have no renewals left. Please return the book to a Regina Public Library today.")
-                        server.send_message(msg)
-                        print("🚀 Email sent successfully! -2")
-                else:
-                    # TODO: XPaths need to be incremented, so format is: f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[2]/div/div[1]/a". Therefore, only topmost book will be renewed now. Change code to renew all books.
-                    break
+                        print(f"❌ An error occurred - 1: {type(e).__name__}: {e}")
+                        # If a book cannot be renewed, check if renewals are left:
+                        try:
+                            renewals_left = int(driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span").text)
+                            if renewals_left == 0:
+                                msg.set_content(f"Book '{book_name}' cannot be renewed because you have no renewals left. Please return the book to a library associated with Regina Public Library today.")
+                                server.send_message(msg)
+                                print("🚀 Email sent successfully! -2")
+                        except Exception as e:
+                            print(f"❌ An error occurred - 2: {type(e).__name__}: {e}")
             except Exception as e:
-                print(f"❌ An error occurred: {type(e).__name__}: {e}")
+                print(f"❌ An error occurred - 3: {type(e).__name__}: {e}")
                 msg.set_content("No more books to be renewed today")
                 server.send_message(msg)
                 print("❌ No more books to renew.")
-                break
 except Exception as e:
     msg.set_content("There is some problem or change in Regina Public Library's website. Sorry, I couldn't renew your books today. Please manually renew it.")
     with smtplib.SMTP(SMTP_server, 587) as server:
