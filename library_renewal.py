@@ -53,7 +53,6 @@ elements_to_be_scraped = {
     "Book's name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div[1]/a",
     "Book's due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/span",
     "'Renew' button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div[2]/form/input[1]",
-
 }
 
 today = dt.today().strftime("%d/%m/%Y")
@@ -131,34 +130,25 @@ try:
 
         server.login(sender_email, sender_password)
         # Click 'Renew' button for each book if due date is today:
-        # VERY IMPORTANT: First, check number of books:
-        # TODO: Try to inspect "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[1]/div[6]/button" = 'Renew All' button if available when you have at most one book borrowed.
-        i: int = 1  # Block of the first book's XPath.
-        while True:
-            try:
-                driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]")
-            except Exception as e:
-                print(f"Error: {e}\n")
-                if i > 1:       # If you have more than one book borrowed, this line is VERY important because it prevents the program from trying to renew a non-existent book.
-                    i -= 1
-                    if i < 2:
-                        print(f"There is {i} book in your account. So the software will try to renew it.")
-                    else:
-                        print(f"There are {i} books in your account. So the software will try to renew them all.")
-                    break       # To avoid the below 'if' statement work if 'i' was 2.
-
-                if i == 1:      # NOTE: 'i' will be still be 1 even if there are no books in the account.
-                    print(f"There are no books that will be overdue soon. So exit the program.")
-                    msg.set_content("No more books to be renewed today")
-                    server.send_message(msg)
-                    print("❌ No more books to renew.")
-                    driver.quit()
-                    sys.exit()
-
-            i += 1
+        # Count only entries with the title and due-date structure of a book card.
+        book_cards_xpath = (
+            "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div"
+            "[div[2]/div/div[1]/a and div[3]/div/span]"
+        )
+        i = len(driver.find_elements(By.XPATH, book_cards_xpath))
+        if i == 0:
+            print("There are no books that will be overdue soon. So exit the program.")
+            msg.set_content("No more books to be renewed today")
+            server.send_message(msg)
+            print("❌ No more books to renew.")
+            sys.exit()
+        elif i == 1:
+            print(f"There is {i} book in your account. So the software will try to renew it.")
+        else:
+            print(f"There are {i} books in your account. So the software will try to renew them all.")
 
         # Renew 'i' number of books:
-        for j in range(1, i+1):
+        for book in range(1, i+1):
             try:
                 book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
                 # If today's date matches book's renewal date, renew it and send an email
