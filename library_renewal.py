@@ -9,6 +9,7 @@ import os
 lazy import sys
 import smtplib
 from selenium import webdriver
+from selenium.common import NoSuchElementException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -96,7 +97,7 @@ driver = build_driver()
 
 # Create email message early
 msg = EmailMessage()
-msg["Subject"] = "Hello from Python!"
+msg["Subject"] = "RPL Auto-Renewer"
 msg["From"] = sender_email
 msg["To"] = receiver_email
 msg.set_content("Initialized message")
@@ -147,8 +148,9 @@ try:
         else:
             print(f"There are {i} books in your account. So the software will try to renew them all.")
 
+        # TODO: Correct the code to iterate over all books, not just first book. Borrow some books, then scrape and compare all those elements using DevTools:
         # Renew 'i' number of books:
-        for book in range(1, i+1):
+        for book_index in range(1, i+1):
             try:
                 book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
                 # If today's date matches book's renewal date, renew it and send an email
@@ -167,24 +169,37 @@ try:
                         print("🚀 Email sent successfully! -1")
 
                         driver.refresh()    # VERY IMPORTANT: This is necessary to ensure that the book's status is updated after renewal.
-                    except Exception as e:
-                        print(f"❌ An error occurred - 1: {type(e).__name__}: {e}")
+                    except NoSuchElementException:
                         # If a book cannot be renewed, check if renewals are left:
                         try:
                             renewals_left = int(driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span").text)
-                            if renewals_left == 0:
+                            if renewals_left == 0:      # Definitely, this will be true but still follow software development principles.
                                 msg.set_content(f"Book '{book_name}' cannot be renewed because you have no renewals left. Please return the book to a library associated with Regina Public Library today.")
                                 server.send_message(msg)
                                 print("🚀 Email sent successfully! -2")
+                            else:
+                                raise NoSuchElementException    # It is not possible that there is no renewal button and renewals_left != 0.
+                        except NoSuchElementException:
+                            msg.set_content(f"Element 'Renewals Left' is not found. Please return '{book_name}' book to a library associated with Regina Public Library today.")
+                            server.send_message(msg)
                         except Exception as e:
-                            print(f"❌ An error occurred - 2: {type(e).__name__}: {e}")
-            except Exception as e:
-                print(f"❌ An error occurred - 3: {type(e).__name__}: {e}")
+                            print(f"❌ An error occurred: {type(e).__name__}: {e}")
+                            msg.set_content(f"❌ A problem occurred while checking if renewals left = 0")
+                            server.send_message(msg)
+                    except Exception as e:
+                        print(f"❌ An error occurred: {type(e).__name__}: {e}")
+                        msg.set_content(f"❌ A problem occurred while renewing book {book_name}")
+                        server.send_message(msg)
+            except NoSuchElementException:
                 msg.set_content("No more books to be renewed today")
                 server.send_message(msg)
                 print("❌ No more books to renew.")
+            except Exception as e:
+                print(f"❌ An error occurred: {type(e).__name__}: {e}")
+                msg.set_content(f"❌ A problem occurred while locating book elements. Check RPL website and renew your books if you have borrowed some.")
+                server.send_message(msg)
 except Exception as e:
-    msg.set_content("There is some problem or change in Regina Public Library's website. Sorry, I couldn't renew your books today. Please manually renew it.")
+    msg.set_content("❌ There is some problem or change in Regina Public Library's website. Sorry, I couldn't renew your books today. Please manually renew it.")
     with smtplib.SMTP(SMTP_server, 587) as server:
         server.ehlo()
         server.starttls()
