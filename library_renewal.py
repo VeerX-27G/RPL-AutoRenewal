@@ -148,8 +148,7 @@ try:
         else:
             print(f"There are {i} books in your account. So the software will try to renew them all.")
 
-        # TODO: Correct the code to iterate over all books, not just first book. Borrow some books, then scrape and compare all those elements using DevTools:
-        # Renew 'i' number of books:
+       # Renew 'i' number of books:
         for book_index in range(1, i+1):
             try:
                 book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
