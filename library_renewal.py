@@ -4,79 +4,175 @@
 #
 # Runs both locally (credentials from a .env file) and on GitHub Actions
 # (credentials from repository secrets exposed as environment variables).
+#
+# Optional environment variables (handy for testing, no code edits needed):
+#   RPL_URL            Page to read the books from. Default: the 'overdue-soon' page.
+#                      For testing use https://www.reginalibrary.ca/myaccount/currently-borrowed/
+#   RENEW_WITHIN_DAYS  Also renew books due within this many days. Default: 0 (due today or overdue only).
 
 import os
-lazy import sys
+import re
 import smtplib
-from selenium import webdriver
-lazy from selenium.common import NoSuchElementException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
-lazy from datetime import datetime as dt
-from dotenv import load_dotenv
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# Loads environment variables if running on a machine, but has not affect on GitHub Actions.
+from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+# Loads environment variables if running on a machine, but has no effect on GitHub Actions.
 load_dotenv()
 
 # GitHub Actions always sets CI=true. Locally it is unset, so the browser opens
 # visibly exactly as before.
 IS_CI = os.getenv("CI", "").lower() == "true"
 
-# Try https://www.reginalibrary.ca/myaccount/currently-borrowed for testing the software below but add '/overdue-soon' in production.
-RPL_url = "https://www.reginalibrary.ca/myaccount/currently-borrowed/"
+# Production page. To test with books that are not due soon, set RPL_URL to
+# https://www.reginalibrary.ca/myaccount/currently-borrowed/ (all borrowed books).
+RPL_URL = os.getenv("RPL_URL") or "https://www.reginalibrary.ca/myaccount/currently-borrowed/overdue-soon"
+
+# 0 = renew books that are due today or already overdue.
+RENEW_WITHIN_DAYS = int(os.getenv("RENEW_WITHIN_DAYS") or 0)
 
 barcode = str(os.getenv("BARCODE"))
 password = str(os.getenv("PASSWORD"))
-SMTP_server = "smtp.gmail.com"
+SMTP_SERVER = "smtp.gmail.com"
 sender_email = str(os.getenv("EMAIL"))
 sender_password = str(os.getenv("SENDER_PASSWORD"))
 receiver_email = sender_email
 
-# Fail fast with a clear message if a secret is missing or misnamed
-missing = [
-    name for name, value in (
-        ("BARCODE", barcode),
-        ("PASSWORD", password),
-        ("EMAIL", sender_email),
-        ("SENDER_PASSWORD", sender_password),
-    ) if not value
-]
-if missing:
-    sys.exit(f"❌ Missing required environment variables / secrets: {', '.join(missing)}")
-
-elements_to_be_scraped = {
+# --- Page locations -------------------------------------------------------------------
+# I could not inspect the logged-in page, so these keep the exact structure of the XPaths
+# that already work for you. The only change: book details are now read *relative to each
+# book card*, so one set of paths works for every book (no more div[{i}] indexing).
+LOGIN_XPATHS = {
     "Go to Login": "/html/body/div[1]/div[3]/a[1]",
     "Username Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[1]/input",
     "Password Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[2]/input",
     "Login Button": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/input[1]",
-    # "Book's name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[2]/div/div[1]/a",
-    # "Book's due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/span",
-    # "'Renew' button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[2]/form/input[1]",
-    # "Renewals left": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/p/span",
 }
 
-today = dt.today().strftime("%d/%m/%Y")
-months = {
-    'Jan': '01',
-    'Feb': '02',
-    'Mar': '03',
-    'Apr': '04',
-    'May': '05',
-    'Jun': '06',
-    'Jul': '07',
-    'Aug': '08',
-    'Sep': '09',
-    'Oct': '10',
-    'Nov': '11',
-    'Dec': '12',
+# Only entries with the title and due-date structure of a book card.
+CARDS_XPATH = (
+    "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div"
+    "/div[div[2]/div/div[1]/a and div[3]/div/span]"
+)
+CARD_XPATHS = {  # relative to one book card
+    "Book's name": "./div[2]/div/div[1]/a",
+    "Book's due date": "./div[3]/div/span",
+    "'Renew' button": "./div[3]/div[2]/form/input[1]",
+    "Renewals left": "./div[3]/div[1]/p/span",
 }
 
-# Modify the book's renewal date format to math regular expression (RegEx) of Python's date format
-def modify_date(date) -> str:
-   return f"{date[2]}/{months[date[1]]}/{dt.now().year}"
+# --- Dates ----------------------------------------------------------------------------
+# Saskatchewan does not observe daylight saving time, so the fallback is a fixed UTC-6.
+try:
+    REGINA = ZoneInfo("America/Regina")
+except ZoneInfoNotFoundError:  # e.g. Windows without the 'tzdata' package
+    REGINA = timezone(timedelta(hours=-6), "CST")
 
+MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+DUE_DATE_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b(?:,?\s+(\d{4}))?",
+    re.IGNORECASE,
+)
+
+
+def today_in_regina() -> date:
+    return datetime.now(REGINA).date()
+
+
+def parse_due_date(text: str, today: date) -> date | None:
+    """Turn page text like 'Due Dec 5' into a date. Returns None if it can't be read.
+
+    The page shows no year, so pick the year that puts the date closest to today
+    (this handles Dec -> Jan rollovers and days without a leading zero).
+    """
+    m = DUE_DATE_RE.search(text)
+    if not m:
+        return None
+    month, day = MONTHS[m.group(1).lower()], int(m.group(2))
+    if m.group(3):
+        try:
+            return date(int(m.group(3)), month, day)
+        except ValueError:
+            return None
+    candidates = []
+    for year in (today.year - 1, today.year, today.year + 1):
+        try:
+            candidates.append(date(year, month, day))
+        except ValueError:  # e.g. Feb 29 in a non-leap year
+            pass
+    return min(candidates, key=lambda d: abs((d - today).days), default=None)
+
+
+def fmt(d: date | None) -> str:
+    return d.strftime("%b %d, %Y") if d else "unknown date"
+
+
+# --- Report ---------------------------------------------------------------------------
+@dataclass
+class Entry:
+    status: str  # RENEWED / NOT RENEWED / NOT DUE / INFO / ERROR
+    text: str
+
+
+@dataclass
+class Book:
+    name: str
+    due_text: str
+    due: date | None
+
+
+class LoginError(Exception):
+    pass
+
+
+def describe(e: Exception) -> str:
+    """Short error text for the EMAIL only. Logs get just the error type: workflow logs can be public."""
+    first_line = (str(e).strip().splitlines() or [""])[0][:300]
+    return f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
+
+
+def build_subject(entries: list[Entry]) -> str:
+    if any(e.status == "ERROR" for e in entries):
+        return "RPL Auto-Renewer: ERROR - please check"
+    if any(e.status == "NOT RENEWED" for e in entries):
+        return "RPL Auto-Renewer: ACTION NEEDED - return a book today"
+    renewed = sum(e.status == "RENEWED" for e in entries)
+    if renewed:
+        return f"RPL Auto-Renewer: {renewed} book{'s' if renewed != 1 else ''} renewed"
+    return "RPL Auto-Renewer: nothing to renew today"
+
+
+def send_report(entries: list[Entry]) -> bool:
+    msg = EmailMessage()
+    msg["Subject"] = build_subject(entries)
+    msg["From"] = sender_email
+    msg["To"] = receiver_email
+    msg.set_content("\n".join(f"{e.status}: {e.text}" for e in entries))
+    try:
+        with smtplib.SMTP(SMTP_SERVER, 587, timeout=30) as server:
+            server.ehlo()  # Identify yourself to the server
+            server.starttls()  # Secure the connection
+            server.ehlo()  # Re-identify as an encrypted connection
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+    except Exception as e:
+        print(f"❌ Could not send the report email: {type(e).__name__}")
+        return False
+    print("🚀 Email report sent successfully.")
+    return True
+
+
+# --- Browser --------------------------------------------------------------------------
 def build_driver():
     options = webdriver.ChromeOptions()
     if IS_CI:
@@ -86,6 +182,7 @@ def build_driver():
         options.add_argument("--no-sandbox")  # required in the runner's container-like environment
         options.add_argument("--disable-dev-shm-usage")  # /dev/shm is small on runners
     drv = webdriver.Chrome(options=options)
+    drv.set_page_load_timeout(60)  # never hang forever on a stuck page
     if IS_CI:
         # Headless Chrome announces itself as "HeadlessChrome" in its user agent,
         # which some sites reject. Report it as regular Chrome instead.
@@ -94,130 +191,168 @@ def build_driver():
     return drv
 
 
-driver = build_driver()
+def login(driver, wait) -> None:
+    driver.get(RPL_URL)
 
-report_entries = []
-
-try:
-    driver.get(RPL_url)
-    wait = WebDriverWait(driver, 20 if IS_CI else 10)  # runners are a bit slower than a laptop
-
-    # Try to log in
-    login_page = wait.until(
-        EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["Go to Login"]))
-    )
+    login_page = wait.until(EC.element_to_be_clickable((By.XPATH, LOGIN_XPATHS["Go to Login"])))
     login_page.click()
 
     # Type your username and password
-    uname_input = wait.until(
-        EC.visibility_of_element_located((By.XPATH, elements_to_be_scraped["Username Input"]))
-    )
+    uname_input = wait.until(EC.visibility_of_element_located((By.XPATH, LOGIN_XPATHS["Username Input"])))
     uname_input.send_keys(barcode)
-    pwd_input = driver.find_element(By.XPATH, elements_to_be_scraped["Password Input"])
+    pwd_input = driver.find_element(By.XPATH, LOGIN_XPATHS["Password Input"])
     pwd_input.send_keys(password)
-    # Click login
-    login_button = driver.find_element(By.XPATH, elements_to_be_scraped["Login Button"])
+    login_button = driver.find_element(By.XPATH, LOGIN_XPATHS["Login Button"])
     login_button.click()
 
-    # Count only entries with the title and due-date structure of a book card.
-    book_cards_xpath = (
-        "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div"
-        "[div[2]/div/div[1]/a and div[3]/div/span]"
-    )
-    n = len(driver.find_elements(By.XPATH, book_cards_xpath))
-    if n == 0:
+    # Don't read the page until it has reacted to the login. Logged in means the login form is
+    # gone (or book cards are showing). If the form is still there, the login did not work -
+    # without this check a wrong PIN looked exactly like "no books due".
+    def login_finished(d):
+        return d.find_elements(By.XPATH, CARDS_XPATH) or not d.find_elements(By.XPATH, LOGIN_XPATHS["Username Input"])
+
+    try:
+        wait.until(login_finished)
+    except TimeoutException:
+        raise LoginError("the login form is still showing after submitting") from None
+
+
+# --- Books ----------------------------------------------------------------------------
+def read_books(driver, today: date) -> list[Book]:
+    books = []
+    for card in driver.find_elements(By.XPATH, CARDS_XPATH):
+        name = card.find_element(By.XPATH, CARD_XPATHS["Book's name"]).text.strip()
+        due_text = card.find_element(By.XPATH, CARD_XPATHS["Book's due date"]).text.strip()
+        books.append(Book(name, due_text, parse_due_date(due_text, today)))
+    return books
+
+
+def find_card(driver, book: Book):
+    """Find a book's card again (cards go stale after a refresh). Name + original due date identify it."""
+    for card in driver.find_elements(By.XPATH, CARDS_XPATH):
+        name = card.find_element(By.XPATH, CARD_XPATHS["Book's name"]).text.strip()
+        due_text = card.find_element(By.XPATH, CARD_XPATHS["Book's due date"]).text.strip()
+        if name == book.name and due_text == book.due_text:
+            return card
+    return None
+
+
+def renewals_left(card) -> int | None:
+    found = card.find_elements(By.XPATH, CARD_XPATHS["Renewals left"])
+    match = re.search(r"\d+", found[0].text) if found else None
+    return int(match.group()) if match else None
+
+
+def renew_book(driver, wait, book: Book) -> Entry:
+    label = f"{book.name} (due {fmt(book.due)})"
+    try:
+        card = find_card(driver, book)
+        if card is None:
+            return Entry("ERROR", f"Could not find {label} on the page again. Please check your account.")
+
+        # find_elements (not a wait): no 'Renew' button is an answer, not something to time out on.
+        buttons = card.find_elements(By.XPATH, CARD_XPATHS["'Renew' button"])
+        if buttons:
+            wait.until(EC.element_to_be_clickable(buttons[0])).click()
+            driver.refresh()  # Refresh to ensure that the book's status is updated after renewal.
+            return Entry("RENEWED", f"{label}.")
+
+        left = renewals_left(card)
+        if left == 0:
+            return Entry("NOT RENEWED", f"{label}; no renewals remain. Please return the book to an RPL library today.")
+        if left is None:
+            return Entry(
+                "NOT RENEWED",
+                f"{label}; there is no Renew button and the renewals-left information could not be found. "
+                "Please return the book to an RPL library today.",
+            )
+        return Entry("ERROR", f'Could not renew "{book.name}" (due {fmt(book.due)}) despite {left} renewals remaining.')
+    except Exception as e:
+        print(f"❌ Could not renew a book: {type(e).__name__}")
+        return Entry("ERROR", f"Could not renew {label} ({describe(e)}).")
+
+
+def run(driver, wait, today: date, entries: list[Entry]) -> None:
+    """Does the work. Results go into `entries` as they happen, so a crash part-way keeps them."""
+    login(driver, wait)
+    books = read_books(driver, today)
+    if not books:
         print("There are no books that will be overdue soon.")
-        report_entries.append("No borrowed books are due for renewal.")
-        print("❌ No more books to renew.")
-    elif n == 1:
-        print(f"There is {n} book in your account. So the software will try to renew it.")
-    else:
-        print(f"There are {n} books in your account. So the software will try to renew them all.")
+        entries.append(Entry("INFO", "No borrowed books are due for renewal."))
+        return
 
-    # Renew 'n' number of books:
-    for i in range(1, n + 1):
+    print(f"Found {len(books)} book{'s' if len(books) != 1 else ''}.")
+    renew_until = today + timedelta(days=RENEW_WITHIN_DAYS)
+    for i, book in enumerate(books, start=1):
+        if book.due is None:
+            entries.append(Entry("ERROR", f"Could not read the due date ('{book.due_text}') of {book.name}."))
+            outcome = "due date unreadable"
+        elif book.due > renew_until:
+            entries.append(Entry("NOT DUE", f"{book.name} (due {fmt(book.due)}); no renewal attempted."))
+            outcome = "not due yet"
+        else:
+            entry = renew_book(driver, wait, book)
+            entries.append(entry)
+            outcome = entry.status.lower()
+        print(f"Book {i}/{len(books)}: {outcome}")  # titles are deliberately not printed: logs can be public
+
+
+def main() -> int:
+    # Fail fast with a clear message if a secret is missing or misnamed
+    missing = [
+        name for name, value in (
+            ("BARCODE", barcode),
+            ("PASSWORD", password),
+            ("EMAIL", sender_email),
+            ("SENDER_PASSWORD", sender_password),
+        ) if not value
+    ]
+    if missing:
+        sys.exit(f"❌ Missing required environment variables / secrets: {', '.join(missing)}")
+
+    entries: list[Entry] = []
+    driver = None
+    try:
+        driver = build_driver()
+        wait = WebDriverWait(driver, 20 if IS_CI else 10)  # runners are a bit slower than a laptop
+        run(driver, wait, today_in_regina(), entries)
+    except LoginError as e:
+        print("❌ Login failed.")
+        entries.append(Entry(
+            "ERROR",
+            f"Could not log in ({e}). Check that your library card number and PIN are still correct "
+            "(BARCODE / PASSWORD), or the RPL login page may have changed. No books were renewed; "
+            "please renew manually if needed.",
+        ))
+    except Exception as e:
+        print(f"❌ An error occurred: {type(e).__name__}")
+        entries.append(Entry(
+            "ERROR",
+            "A problem occurred with the Regina Public Library website. "
+            "The renewal may not have completed; please check your account and renew books manually if needed. "
+            f"Details: {describe(e)}",
+        ))
+        # URL and title only. Screenshots / page source are not saved because
+        # they would contain your account page and logs/artifacts may be public.
         try:
-            book_name = driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[2]/div/div[1]/a").text
-            due_date = modify_date(
-                driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/span").text.split()
-            )
-            print(f"Due date: {due_date} of book '{book_name}'")
-            if due_date != today:
-                try:
-                    renewal_button = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[2]/form/input[1]"))
-                    )
-                    renewal_button.click()
-                    report_entries.append(f"RENEWED: {book_name} (due {due_date}).")
-                    driver.refresh()  # Refresh to ensure that the book's status is updated after renewal.
-                except NoSuchElementException:
-                    try:
-                        renewals_left = driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[1]/p/span").text
-                        if renewals_left == '0':
-                            report_entries.append(
-                                f"NOT RENEWED: {book_name} (due {due_date}); no renewals remain. "
-                                "Please return the book to an RPL library today."
-                            )
-                        else:
-                            report_entries.append(
-                                f'ERROR: Could not renew "{book_name}" (due {due_date}) despite '
-                                f"{renewals_left} renewals remaining."
-                            )
-                    except NoSuchElementException:
-                        report_entries.append(
-                            f"NOT RENEWED: {book_name} (due {due_date}); the renewals-left information "
-                            "could not be found. Please return the book to an RPL library today."
-                        )
-                    except Exception as e:
-                        print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                        report_entries.append(
-                            f"ERROR: Could not check remaining renewals for {book_name} "
-                            f"({type(e).__name__}: {e})."
-                        )
-                except Exception as e:
-                    print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                    report_entries.append(
-                        f"ERROR: Could not renew {book_name} ({type(e).__name__}: {e})."
-                    )
-            else:
-                report_entries.append(f"NOT DUE: {book_name} (due {due_date}); no renewal attempted.")
-        except NoSuchElementException:
-            report_entries.append("ERROR: Could not find the next book's information on the page.")
-            print("❌ No more books to renew.")
-        except Exception as e:
-            print(f"❌ An error occurred: {type(e).__name__}: {e}")
-            report_entries.append(
-                f"ERROR: Could not locate book information ({type(e).__name__}: {e}). "
-                "Check the RPL website and manually renew any borrowed books if needed."
-            )
-except Exception as e:
-    report_entries.append(
-        "ERROR: A problem occurred with the Regina Public Library website. Or maybe one of your login credentials changed."
-        "The renewal may not have completed; please check your account and renew books manually if needed. "
-        f"Details: {type(e).__name__}: {e}"
-    )
+            print(f"Current URL: {driver.current_url}")
+            print(f"Page title: {driver.title}")
+        except Exception:
+            print("(The browser is no longer reachable.)")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
-    print(f"❌ An error occurred: {type(e).__name__}: {e}")
+    # Always report, even after a crash, so you are never left guessing.
+    sent = send_report(entries)
+    print("Task completed")
+    had_errors = any(e.status == "ERROR" for e in entries)
+    # A non-zero exit makes the GitHub Actions run show red (and GitHub emails you), even if Gmail fails.
+    return 1 if (had_errors or not sent) else 0
 
-    # URL and title only. Screenshots / page source are not saved because
-    # they would contain your account page and logs/artifacts may be public.
-    print(f"Current URL: {driver.current_url}")
-    print(f"Page title: {driver.title}")
-finally:
-    driver.quit()
 
-msg = EmailMessage()
-msg["Subject"] = "RPL Auto-Renewer"
-msg["From"] = sender_email
-msg["To"] = receiver_email
-msg.set_content("\n".join(report_entries))
-
-with smtplib.SMTP(SMTP_server, 587) as server:
-    server.ehlo()
-    server.starttls()
-    server.ehlo()
-    server.login(sender_email, sender_password)
-    server.send_message(msg)
-
-print("🚀 Email report sent successfully.")
-print("Task completed")
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,5 +1,9 @@
 [project]
-name = "day-98-custom-automation"
+name = "rpl-autorenewal"
 version = "0.1.0"
-requires-python = ">=3.15"
-dependencies = []
+description = "Renews due-soon Regina Public Library books with Selenium and emails a report."
+requires-python = ">=3.10"
+dependencies = [
+    "selenium>=4.54,<5",
+    "python-dotenv>=1.2,<2",
+]

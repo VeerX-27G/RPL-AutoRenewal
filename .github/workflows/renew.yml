@@ -1,9 +1,10 @@
 name: RPL Auto Renewal
 
 on:
-  # 12:00 A.M. in Regina (Saskatchewan does not observe daylight saving time) is 06:00 UTC.
+  # 00:17 in Regina (Saskatchewan does not observe daylight saving time) is 06:17 UTC.
+  # The odd minute is deliberate: GitHub delays or drops scheduled runs at the top of the hour.
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "17 6 * * *"
   # Lets you run it by hand from the Actions tab to test.
   workflow_dispatch:
 
@@ -19,13 +20,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # library_renewal.py uses `lazy import`, which needs Python 3.15 or newer.
-      # allow-prereleases lets this keep working if 3.15 is not yet a stable build on the runner.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.15"
-          allow-prereleases: true
+          python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
@@ -37,8 +35,7 @@ jobs:
       # Selenium 4.6+ locates the matching driver automatically.
       - name: Run renewal script
         env:
-          # Runner clocks are UTC. The script compares due dates against "today",
-          # so make "today" the Regina date.
+          # The script works out the Regina date itself; TZ just keeps log timestamps in Regina time.
           TZ: America/Regina
           BARCODE: ${{ secrets.BARCODE }}
           PASSWORD: ${{ secrets.PASSWORD }}
