@@ -9,7 +9,7 @@ import os
 lazy import sys
 import smtplib
 from selenium import webdriver
-from selenium.common import NoSuchElementException
+lazy from selenium.common import NoSuchElementException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -95,12 +95,7 @@ def build_driver():
 
 driver = build_driver()
 
-# Create email message early
-msg = EmailMessage()
-msg["Subject"] = "RPL Auto-Renewer"
-msg["From"] = sender_email
-msg["To"] = receiver_email
-msg.set_content("Initialized message")
+report_entries = []
 
 try:
     driver.get(RPL_url)
@@ -123,88 +118,86 @@ try:
     login_button = driver.find_element(By.XPATH, elements_to_be_scraped["Login Button"])
     login_button.click()
 
-    # Send that message
-    with smtplib.SMTP(SMTP_server, 587) as server:
-        server.ehlo()       # Identify yourself to the server
-        server.starttls()   # Secure the connection
-        server.ehlo()       # Re-identify as an encrypted connection
+    # Count only entries with the title and due-date structure of a book card.
+    book_cards_xpath = (
+        "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div"
+        "[div[2]/div/div[1]/a and div[3]/div/span]"
+    )
+    n = len(driver.find_elements(By.XPATH, book_cards_xpath))
+    if n == 0:
+        print("There are no books that will be overdue soon.")
+        report_entries.append("No borrowed books are due for renewal.")
+        print("❌ No more books to renew.")
+    elif n == 1:
+        print(f"There is {n} book in your account. So the software will try to renew it.")
+    else:
+        print(f"There are {n} books in your account. So the software will try to renew them all.")
 
-        server.login(sender_email, sender_password)
-        # Click 'Renew' button for each book if due date is today:
-        # Count only entries with the title and due-date structure of a book card.
-        book_cards_xpath = (
-            "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div"
-            "[div[2]/div/div[1]/a and div[3]/div/span]"
-        )
-        i = len(driver.find_elements(By.XPATH, book_cards_xpath))
-        if i == 0:
-            print("There are no books that will be overdue soon. So exit the program.")
-            msg.set_content("No more books to be renewed today")
-            server.send_message(msg)
-            print("❌ No more books to renew.")
-            sys.exit()
-        elif i == 1:
-            print(f"There is {i} book in your account. So the software will try to renew it.")
-        else:
-            print(f"There are {i} books in your account. So the software will try to renew them all.")
-
-       # Renew 'i' number of books:
-        for book_index in range(1, i+1):
-            try:
-                book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
-                # If today's date matches book's renewal date, renew it and send an email
-                due_date = modify_date(driver.find_element(By.XPATH, elements_to_be_scraped["Book's due date"]).text.split())
-                print(f"Due date: {due_date} of book '{book_name}'")
-                # Try due_date != today if you are testing this software but not in production.
-                if due_date == today:
+    # Renew 'n' number of books:
+    for i in range(1, n + 1):
+        try:
+            book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
+            due_date = modify_date(
+                driver.find_element(By.XPATH, elements_to_be_scraped["Book's due date"]).text.split()
+            )
+            print(f"Due date: {due_date} of book '{book_name}'")
+            if due_date == today:
+                try:
+                    renewal_button = wait.until(
+                        EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["'Renew' button"]))
+                    )
+                    renewal_button.click()
+                    report_entries.append(f"RENEWED: {book_name} (due {due_date}).")
+                    driver.refresh()  # Refresh to ensure that the book's status is updated after renewal.
+                except NoSuchElementException:
                     try:
-                        renewal_button = wait.until(
-                            EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["'Renew' button"]))
-                        )
-                        renewal_button.click()
-                        msg.set_content(f"Book '{book_name}' renewed successfully.")
-                        server.send_message(msg)
-                        # Book titles are deliberately not printed: workflow logs can be public.
-                        print("🚀 Email sent successfully! -1")
-
-                        driver.refresh()    # VERY IMPORTANT: This is necessary to ensure that the book's status is updated after renewal.
+                        renewals_left = int(driver.find_element(
+                            By.XPATH,
+                            "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span",
+                        ).text)
+                        if renewals_left == 0:
+                            report_entries.append(
+                                f"NOT RENEWED: {book_name} (due {due_date}); no renewals remain. "
+                                "Please return the book to an RPL library today."
+                            )
+                        else:
+                            report_entries.append(
+                                f"ERROR: Could not renew {book_name} (due {due_date}) despite "
+                                f"{renewals_left} renewals remaining."
+                            )
                     except NoSuchElementException:
-                        # If a book cannot be renewed, check if renewals are left:
-                        try:
-                            renewals_left = int(driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span").text)
-                            if renewals_left == 0:      # Definitely, this will be true but still follow software development principles.
-                                msg.set_content(f"Book '{book_name}' cannot be renewed because you have no renewals left. Please return the book to a library associated with Regina Public Library today.")
-                                server.send_message(msg)
-                                print("🚀 Email sent successfully! -2")
-                            else:
-                                raise NoSuchElementException    # It is not possible that there is no renewal button and renewals_left != 0.
-                        except NoSuchElementException:
-                            msg.set_content(f"Element 'Renewals Left' is not found. Please return '{book_name}' book to a library associated with Regina Public Library today.")
-                            server.send_message(msg)
-                        except Exception as e:
-                            print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                            msg.set_content(f"❌ A problem occurred while checking if renewals left = 0")
-                            server.send_message(msg)
+                        report_entries.append(
+                            f"NOT RENEWED: {book_name} (due {due_date}); the renewals-left information "
+                            "could not be found. Please return the book to an RPL library today."
+                        )
                     except Exception as e:
                         print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                        msg.set_content(f"❌ A problem occurred while renewing book {book_name}")
-                        server.send_message(msg)
-            except NoSuchElementException:
-                msg.set_content("No more books to be renewed today")
-                server.send_message(msg)
-                print("❌ No more books to renew.")
-            except Exception as e:
-                print(f"❌ An error occurred: {type(e).__name__}: {e}")
-                msg.set_content(f"❌ A problem occurred while locating book elements. Check RPL website and renew your books if you have borrowed some.")
-                server.send_message(msg)
+                        report_entries.append(
+                            f"ERROR: Could not check remaining renewals for {book_name} "
+                            f"({type(e).__name__}: {e})."
+                        )
+                except Exception as e:
+                    print(f"❌ An error occurred: {type(e).__name__}: {e}")
+                    report_entries.append(
+                        f"ERROR: Could not renew {book_name} ({type(e).__name__}: {e})."
+                    )
+            else:
+                report_entries.append(f"NOT DUE: {book_name} (due {due_date}); no renewal attempted.")
+        except NoSuchElementException:
+            report_entries.append("ERROR: Could not find the next book's information on the page.")
+            print("❌ No more books to renew.")
+        except Exception as e:
+            print(f"❌ An error occurred: {type(e).__name__}: {e}")
+            report_entries.append(
+                f"ERROR: Could not locate book information ({type(e).__name__}: {e}). "
+                "Check the RPL website and manually renew any borrowed books if needed."
+            )
 except Exception as e:
-    msg.set_content("❌ There is some problem or change in Regina Public Library's website. Sorry, I couldn't renew your books today. Please manually renew it.")
-    with smtplib.SMTP(SMTP_server, 587) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(sender_email, sender_password)
-        server.send_message(msg)
+    report_entries.append(
+        "ERROR: A problem occurred with the Regina Public Library website. "
+        "The renewal may not have completed; please check your account and renew books manually if needed. "
+        f"Details: {type(e).__name__}: {e}"
+    )
 
     print(f"❌ An error occurred: {type(e).__name__}: {e}")
 
@@ -215,4 +208,18 @@ except Exception as e:
 finally:
     driver.quit()
 
+msg = EmailMessage()
+msg["Subject"] = "RPL Auto-Renewer"
+msg["From"] = sender_email
+msg["To"] = receiver_email
+msg.set_content("RPL Auto-Renewer report\n\n" + "\n".join(report_entries))
+
+with smtplib.SMTP(SMTP_server, 587) as server:
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login(sender_email, sender_password)
+    server.send_message(msg)
+
+print("🚀 Email report sent successfully.")
 print("Task completed")
