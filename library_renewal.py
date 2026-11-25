@@ -25,7 +25,7 @@ load_dotenv()
 IS_CI = os.getenv("CI", "").lower() == "true"
 
 # Try https://www.reginalibrary.ca/myaccount/currently-borrowed for testing the software below but add '/overdue-soon' in production.
-RPL_url = "https://www.reginalibrary.ca/myaccount/currently-borrowed/overdue-soon"
+RPL_url = "https://www.reginalibrary.ca/myaccount/currently-borrowed/"
 
 barcode = str(os.getenv("BARCODE"))
 password = str(os.getenv("PASSWORD"))
@@ -51,9 +51,10 @@ elements_to_be_scraped = {
     "Username Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[1]/input",
     "Password Input": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/div[2]/input",
     "Login Button": "/html/body/div[1]/header/div[2]/div/div[2]/div[2]/div/div/li/div/form/input[1]",
-    "Book's name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div[1]/a",
-    "Book's due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/span",
-    "'Renew' button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div[2]/form/input[1]",
+    # "Book's name": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[2]/div/div[1]/a",
+    # "Book's due date": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/span",
+    # "'Renew' button": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[2]/form/input[1]",
+    # "Renewals left": "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/p/span",
 }
 
 today = dt.today().strftime("%d/%m/%Y")
@@ -136,33 +137,30 @@ try:
     # Renew 'n' number of books:
     for i in range(1, n + 1):
         try:
-            book_name = driver.find_element(By.XPATH, elements_to_be_scraped["Book's name"]).text
+            book_name = driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[2]/div/div[1]/a").text
             due_date = modify_date(
-                driver.find_element(By.XPATH, elements_to_be_scraped["Book's due date"]).text.split()
+                driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div/span").text.split()
             )
             print(f"Due date: {due_date} of book '{book_name}'")
-            if due_date == today:
+            if due_date != today:
                 try:
                     renewal_button = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, elements_to_be_scraped["'Renew' button"]))
+                        EC.element_to_be_clickable((By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[2]/form/input[1]"))
                     )
                     renewal_button.click()
                     report_entries.append(f"RENEWED: {book_name} (due {due_date}).")
                     driver.refresh()  # Refresh to ensure that the book's status is updated after renewal.
                 except NoSuchElementException:
                     try:
-                        renewals_left = int(driver.find_element(
-                            By.XPATH,
-                            "/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div/div[3]/div/p/span",
-                        ).text)
-                        if renewals_left == 0:
+                        renewals_left = driver.find_element(By.XPATH, f"/html/body/div[1]/div[1]/main/div[2]/div/div/div[2]/div/div[2]/div[2]/div/div/div[{i}]/div[3]/div[1]/p/span").text
+                        if renewals_left == '0':
                             report_entries.append(
                                 f"NOT RENEWED: {book_name} (due {due_date}); no renewals remain. "
                                 "Please return the book to an RPL library today."
                             )
                         else:
                             report_entries.append(
-                                f"ERROR: Could not renew {book_name} (due {due_date}) despite "
+                                f'ERROR: Could not renew "{book_name}" (due {due_date}) despite '
                                 f"{renewals_left} renewals remaining."
                             )
                     except NoSuchElementException:
@@ -194,7 +192,7 @@ try:
             )
 except Exception as e:
     report_entries.append(
-        "ERROR: A problem occurred with the Regina Public Library website. "
+        "ERROR: A problem occurred with the Regina Public Library website. Or maybe one of your login credentials changed."
         "The renewal may not have completed; please check your account and renew books manually if needed. "
         f"Details: {type(e).__name__}: {e}"
     )
@@ -212,7 +210,7 @@ msg = EmailMessage()
 msg["Subject"] = "RPL Auto-Renewer"
 msg["From"] = sender_email
 msg["To"] = receiver_email
-msg.set_content("RPL Auto-Renewer report\n\n" + "\n".join(report_entries))
+msg.set_content("\n".join(report_entries))
 
 with smtplib.SMTP(SMTP_server, 587) as server:
     server.ehlo()
